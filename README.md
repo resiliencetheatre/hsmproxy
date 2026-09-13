@@ -23,6 +23,13 @@ either host, and card-removal/restart recovery. See [TESTING.md](TESTING.md)
 for the test record and remaining coverage. This is a custom proof-of-concept
 protocol, not a production-reviewed security transport.
 
+## Questions
+
+* What risks are managed with this kind of implementation ?
+* Are there any risks still remaining ?
+* Risks, are they development, usage or underlying science ? 
+* What would make this restricted implementation ? 
+
 ## Build and test on Debian 13
 
 ```sh
