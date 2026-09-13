@@ -96,4 +96,46 @@ max_payload = 1400
     proc.wait(timeout=3)
     proc.communicate(timeout=3)
     assert proc.returncode != 0
-print('config: strict parsing, pins, missing module/token, and interrupted PIN tests passed')
+    # Supervised startup reports structured errors and never logs in without a
+    # user submission. Use a missing module so these tests cannot touch a card.
+    import os
+    import socket
+    config.write_text(source.replace('/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so', '/nonexistent/hsmproxy-test.so'))
+    def supervised():
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        read_pin, write_pin = os.pipe()
+        proc = subprocess.Popen([str(EXE), '--config', str(config),
+            '--supervise-fd', str(child.fileno()), '--pin-fd', str(read_pin)],
+            pass_fds=(child.fileno(), read_pin), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        child.close()
+        os.close(read_pin)
+        parent.settimeout(3)
+        parent.send(b'PING')
+        return proc, parent, write_pin
+    proc, channel, credential = supervised()
+    state = channel.recv(512).split()
+    assert state[:3] == [b'HSPUI1', b'0', b'2'], state
+    # A duplicate managed instance is rejected before requesting another PIN.
+    duplicate, other, duplicate_pin = supervised()
+    assert other.recv(512).split()[:3] == [b'HSPUI1', b'6', b'10']
+    duplicate.communicate(timeout=3)
+    assert duplicate.returncode == 1
+    other.close(); os.close(duplicate_pin)
+    # Closing the frontend while waiting for a PIN must terminate the backend.
+    channel.close(); os.close(credential)
+    proc.communicate(timeout=3)
+    assert proc.returncode != 0
+    # A hung frontend cannot keep its child alive by leaving the socket open.
+    proc, channel, credential = supervised()
+    assert channel.recv(512).startswith(b'HSPUI1 ')
+    proc.communicate(timeout=6)
+    assert proc.returncode != 0
+    channel.close(); os.close(credential)
+    # Invalid profiles reach the frontend as a stable error before any PIN.
+    config.write_text('invalid configuration')
+    proc, channel, credential = supervised()
+    assert channel.recv(512).split()[:3] == [b'HSPUI1', b'6', b'8']
+    proc.communicate(timeout=3)
+    assert proc.returncode == 2
+    channel.close(); os.close(credential)
+print('config: strict parsing, pins, supervised discovery/errors, duplicate launch, frontend timeout/EOF and interrupted PIN passed')

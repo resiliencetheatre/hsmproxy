@@ -173,6 +173,24 @@ For ordinary operation, restart without `--test-channels` and launch gtk-pipe
 as below. Test payloads are carried as opaque application datagrams; no tunnel
 wire-format change or plaintext network path is added.
 
+## Integrated GTK frontend (optional)
+
+The optional secure mode in the updated GTK Pipe starts hsmproxy, discovers the
+configured card, prompts for the user PIN in a masked dialog, and displays
+separate card, identity, tunnel, and peer-application state. It preserves the
+standalone GTK Pipe launcher and keeps hsmproxy independent of GTK/GStreamer.
+
+```sh
+make
+make -C gtk-pipe
+./gtk-pipe/gtk-pipe --secure-config /absolute/path/to/site-a.ini --hsmproxy "$PWD/hsmproxy"
+```
+
+Do not run a separate manual proxy for this connection. The secure frontend
+owns its child process. See [FRONTEND.md](FRONTEND.md) for installation, profile
+selection, lifecycle behavior, the local IPC contract, and test coverage.
+Without the optional frontend, use the original procedure below.
+
 ## Run unchanged gtk-pipe
 
 On each host, launch the separately installed application with:

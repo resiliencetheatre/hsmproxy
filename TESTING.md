@@ -167,3 +167,15 @@ testing; it is not a claim that every step has passed.
 The automated suites and sanitizer/leak checks passed on this workspace.
 A separate copy containing no `gtk-pipe/` directory also built successfully
 and installed into a temporary staging directory.
+
+
+## Optional desktop integration (2026-09-13)
+
+The new frontend is covered separately from the earlier operator-reported
+hardware run. Backend tests cover read-only discovery, PIN-error classification,
+private supervision IPC, stale/closed supervisor gates, backpressure, duplicate
+managed launch rejection, and supervised startup errors. GTK parser and headless
+controller tests cover PIN cancel/submit, buffer clearing, bad PIN, session
+refresh, disconnect/reconnect, stale/malformed status and dialog teardown.
+See [FRONTEND.md](FRONTEND.md) for commands and real-card acceptance requirements.
+No real-card two-host graphical test is claimed for this new frontend.

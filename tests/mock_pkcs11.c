@@ -16,7 +16,12 @@ static CK_RV slots(CK_BBOOL present,CK_SLOT_ID_PTR out,CK_ULONG_PTR n) {
 }
 static CK_RV token(CK_SLOT_ID slot,CK_TOKEN_INFO_PTR info) {
     (void)slot; memset(info,0,sizeof(*info)); memset(info->serialNumber,' ',sizeof(info->serialNumber));
-    memcpy(info->serialNumber,"TEST123",7); return CKR_OK;
+    memcpy(info->serialNumber,"TEST123",7);
+    int m=atomic_load(&mode);
+    if(m==5) info->flags=CKF_USER_PIN_LOCKED;
+    if(m==6) info->flags=CKF_USER_PIN_COUNT_LOW;
+    if(m==7) info->flags=CKF_USER_PIN_FINAL_TRY;
+    return CKR_OK;
 }
 static CK_RV slot_info(CK_SLOT_ID slot,CK_SLOT_INFO_PTR info) {
     (void)slot; memset(info,0,sizeof(*info)); info->flags=CKF_HW_SLOT;

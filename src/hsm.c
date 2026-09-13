@@ -53,12 +53,12 @@ static bool sign_digest(struct hsm *h,const uint8_t digest[32],uint8_t signature
     }
     return true;
 }
-bool hsm_open(struct hsm *h,const struct config *c,EVP_PKEY *key,const uint8_t *pin,size_t pin_len,char *error,size_t cap) {
-    memset(h,0,sizeof(*h)); h->session=CK_INVALID_HANDLE; h->event_fd=-1;
+static bool prepare(struct hsm *h,const struct config *c,char *error,size_t cap) {
+    memset(h,0,sizeof(*h)); h->open_error=HSM_UNAVAILABLE; h->session=CK_INVALID_HANDLE; h->event_fd=-1;
     atomic_init(&h->failed,false); atomic_init(&h->stop,false); atomic_init(&h->monitor_at,0); atomic_init(&h->failure_detail,0);
     if(pthread_mutex_init(&h->mutex,NULL)) { snprintf(error,cap,"mutex initialization failed"); return false; }
     if(pthread_cond_init(&h->cond,NULL)) { pthread_mutex_destroy(&h->mutex); snprintf(error,cap,"condition initialization failed"); return false; }
-    h->initialized=true; const char *why="PKCS#11 module load failed";
+    h->initialized=true; enum hsm_discovery code=HSM_UNAVAILABLE; const char *why="PKCS#11 module load failed";
     h->module=dlopen(c->module,RTLD_NOW|RTLD_LOCAL); if(!h->module) goto bad;
     CK_C_GetFunctionList get=NULL; void *symbol=dlsym(h->module,"C_GetFunctionList");
     _Static_assert(sizeof(get)==sizeof(symbol),"function pointer representation");
@@ -69,32 +69,55 @@ bool hsm_open(struct hsm *h,const struct config *c,EVP_PKEY *key,const uint8_t *
     CK_SLOT_ID slots[64]; CK_ULONG count=64;
     why="no unique configured token/reader found";
     if(h->api->C_GetSlotList(CK_TRUE,slots,&count)!=CKR_OK || count>64) goto bad;
+    code=HSM_NO_CARD;
     unsigned matches=0;
     for(CK_ULONG i=0;i<count;i++) {
         CK_TOKEN_INFO ti; CK_SLOT_INFO si;
         if(h->api->C_GetTokenInfo(slots[i],&ti)==CKR_OK && h->api->C_GetSlotInfo(slots[i],&si)==CKR_OK &&
            (si.flags&CKF_HW_SLOT) && padded_equal(ti.serialNumber,sizeof(ti.serialNumber),c->serial) &&
            padded_equal(si.slotDescription,sizeof(si.slotDescription),c->reader)) {
-            h->slot=slots[i]; matches++;
+            h->slot=slots[i]; h->token_flags=ti.flags; matches++;
         }
     }
     if(matches!=1) goto bad;
     /* Capture the insertion counter before signing. The monitor must reject
      * even a remove/reinsert between startup verification and its first wait. */
     why="PC/SC configured reader unavailable";
-    if(SCardEstablishContext(SCARD_SCOPE_SYSTEM,NULL,NULL,&h->pcsc)!=SCARD_S_SUCCESS) goto bad;
+    if(SCardEstablishContext(SCARD_SCOPE_SYSTEM,NULL,NULL,&h->pcsc)!=SCARD_S_SUCCESS) { code=HSM_UNAVAILABLE; goto bad; }
     strcpy(h->reader,c->reader); strcpy(h->serial,c->serial);
     SCARD_READERSTATE initial={0}; initial.szReader=h->reader;
     if(SCardGetStatusChange(h->pcsc,0,&initial,1)!=SCARD_S_SUCCESS ||
        !(initial.dwEventState&SCARD_STATE_PRESENT) ||
        (initial.dwEventState&(SCARD_STATE_UNKNOWN|SCARD_STATE_UNAVAILABLE|SCARD_STATE_MUTE))) goto bad;
     h->reader_state=initial.dwEventState & ~SCARD_STATE_CHANGED;
+    code=HSM_IDENTITY_ERROR;
     CK_MECHANISM_INFO mi; why="P-256 ECDSA signing unsupported";
     if(h->api->C_GetMechanismInfo(h->slot,CKM_ECDSA,&mi)!=CKR_OK || !(mi.flags&CKF_SIGN) ||
        mi.ulMinKeySize>256 || mi.ulMaxKeySize<256) goto bad;
-    why="PKCS#11 session/login failed (PIN will not be retried)";
-    if(h->api->C_OpenSession(h->slot,CKF_SERIAL_SESSION,NULL,NULL,&h->session)!=CKR_OK ||
-       h->api->C_Login(h->session,CKU_USER,(CK_UTF8CHAR_PTR)pin,(CK_ULONG)pin_len)!=CKR_OK) goto bad;
+    return true;
+bad:
+    snprintf(error,cap,"%s",why); hsm_close(h); h->open_error=code; return false;
+}
+enum hsm_discovery hsm_probe(const struct config *c) {
+    struct hsm h; char error[256];
+    if(!prepare(&h,c,error,sizeof(error))) return h.open_error;
+    enum hsm_discovery state=(h.token_flags & CKF_USER_PIN_LOCKED)?HSM_PIN_LOCKED:
+        (h.token_flags & CKF_USER_PIN_FINAL_TRY)?HSM_PIN_FINAL:
+        (h.token_flags & CKF_USER_PIN_COUNT_LOW)?HSM_PIN_LOW:HSM_READY;
+    hsm_close(&h); return state;
+}
+bool hsm_open(struct hsm *h,const struct config *c,EVP_PKEY *key,const uint8_t *pin,size_t pin_len,char *error,size_t cap) {
+    if(!prepare(h,c,error,cap)) return false;
+    enum hsm_discovery code=HSM_LOGIN_ERROR;
+    const char *why="PKCS#11 session/login failed (PIN will not be retried)";
+    if(h->api->C_OpenSession(h->slot,CKF_SERIAL_SESSION,NULL,NULL,&h->session)!=CKR_OK) goto bad;
+    CK_RV login=h->api->C_Login(h->session,CKU_USER,(CK_UTF8CHAR_PTR)pin,(CK_ULONG)pin_len);
+    if(login!=CKR_OK) {
+        if(login==CKR_PIN_INCORRECT) { code=HSM_PIN_INCORRECT; why="PIN incorrect; login failed (PIN will not be retried)"; }
+        else if(login==CKR_PIN_LOCKED) { code=HSM_PIN_LOCKED; why="User PIN blocked; administrator recovery required"; }
+        goto bad;
+    }
+    code=HSM_IDENTITY_ERROR;
     h->logged_in=true;
     uint8_t id[64]; size_t id_len=sizeof(id); (void)parse_hex(c->key_id,id,&id_len);
     CK_OBJECT_CLASS klass=CKO_PRIVATE_KEY; CK_KEY_TYPE kind=CKK_EC;
@@ -123,7 +146,7 @@ bool hsm_open(struct hsm *h,const struct config *c,EVP_PKEY *key,const uint8_t *
     if(h->event_fd<0) { why="eventfd failed"; goto bad; }
     return true;
 bad:
-    snprintf(error,cap,"%s",why); hsm_close(h); return false;
+    snprintf(error,cap,"%s",why); hsm_close(h); h->open_error=code; return false;
 }
 static void *worker(void *arg) {
     struct hsm *h=arg;

@@ -1,0 +1,9 @@
+/hsmproxy
+/tests/test_core
+/tests/test_hsm
+/tests/test_supervisor
+/tests/mock_pkcs11.so
+/tests/test_sanitize
+/tests/test_hsm_sanitize
+/tests/test_supervisor_sanitize
+gtk-pipe

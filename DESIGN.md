@@ -477,3 +477,13 @@ Implementation milestones and their acceptance criteria:
 Operator-reported real-card diagnostics passed at 1100-byte payloads, followed
 by gtk-pipe verification with apparently stable operation. See `TESTING.md`
 for the evidence and remaining measurement and fault-injection coverage.
+
+
+## 9. Optional desktop supervision
+
+The implemented optional local supervision interface and GTK secure mode are
+specified in [FRONTEND.md](FRONTEND.md). They extend the initial UI scope while
+preserving this network protocol, peer pinning, cryptography, and fail-closed
+card gate. GTK Pipe retains its standalone mode; each project builds and
+installs independently. Current GTK Pipe also supports `--rtp-mtu`, superseding
+the older source-reference observation in sections 1 and 5.

@@ -42,8 +42,18 @@ int main(void) {
     struct config c={0}; strcpy(c.module,path); strcpy(c.serial,"TEST123"); strcpy(c.reader,"Test Reader"); strcpy(c.key_id,"01");
     char error[256]; struct hsm h;
     configure(key,0);
+    assert(hsm_probe(&c)==HSM_READY);
+    configure(key,5); assert(hsm_probe(&c)==HSM_PIN_LOCKED);
+    configure(key,6); assert(hsm_probe(&c)==HSM_PIN_LOW);
+    configure(key,7); assert(hsm_probe(&c)==HSM_PIN_FINAL);
+    configure(key,0);
+    atomic_store(&pcsc_mode,1); assert(hsm_probe(&c)==HSM_NO_CARD);
+    atomic_store(&pcsc_mode,0);
+    configure(key,1); assert(hsm_probe(&c)==HSM_NO_CARD);
+    configure(key,0);
     assert(!hsm_open(&h,&c,key,(const uint8_t *)"wrong",5,error,sizeof(error)));
     assert(strstr(error,"login failed"));
+    assert(h.open_error==HSM_PIN_INCORRECT);
     configure(key,1); assert(!hsm_open(&h,&c,key,(const uint8_t *)"1234",4,error,sizeof(error)));
     configure(key,2); assert(!hsm_open(&h,&c,key,(const uint8_t *)"1234",4,error,sizeof(error)));
     configure(key,3); assert(!hsm_open(&h,&c,key,(const uint8_t *)"1234",4,error,sizeof(error)));

@@ -5,7 +5,12 @@
 #include <stdatomic.h>
 #include <p11-kit/pkcs11.h>
 #include <winscard.h>
+enum hsm_discovery { HSM_READY, HSM_NO_CARD, HSM_UNAVAILABLE, HSM_PIN_LOCKED,
+                     HSM_PIN_INCORRECT, HSM_LOGIN_ERROR, HSM_IDENTITY_ERROR,
+                     HSM_PIN_LOW, HSM_PIN_FINAL };
 struct hsm {
+    enum hsm_discovery open_error;
+    CK_FLAGS token_flags;
     void *module;
     CK_FUNCTION_LIST_PTR api;
     CK_SLOT_ID slot;
@@ -28,6 +33,7 @@ struct hsm {
     int event_fd;
 };
 uint64_t monotonic_ms(void);
+enum hsm_discovery hsm_probe(const struct config *);
 bool hsm_open(struct hsm *,const struct config *,EVP_PKEY *,const uint8_t *,size_t,char *,size_t);
 bool hsm_start(struct hsm *,char *,size_t);
 bool hsm_submit(struct hsm *,uint64_t,const uint8_t[32]);

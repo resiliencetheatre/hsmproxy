@@ -2,6 +2,7 @@
 #include "config.h"
 #include "hsm.h"
 #include "channel_test.h"
+#include "supervisor.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -18,6 +19,8 @@
 #include <unistd.h>
 
 struct app {
+    struct supervisor supervisor;
+    enum ui_reason end_reason;
     struct config config;
     struct hsm hsm;
     struct peer peer;
@@ -27,8 +30,12 @@ struct app {
     uint64_t send_drops, local_drops, source_drops, truncations, mtu_drops;
 };
 static void log_event(void *arg,const char *message) { (void)arg; fprintf(stderr,"hsmproxy: %s\n",message); }
+static void startup_error(struct app *a) {
+    struct config c={.ports={5000,5002,5004},.max_payload=1400};
+    supervisor_status(&a->supervisor,&c,&a->peer,UI_ERROR,UI_CONFIG_ERROR,monotonic_ms(),true,0);
+}
 static bool health(struct app *a) {
-    uint64_t now=monotonic_ms(); bool ok=hsm_healthy(&a->hsm,now);
+    uint64_t now=monotonic_ms(); bool ok=hsm_healthy(&a->hsm,now) && supervisor_healthy(&a->supervisor,now);
     peer_health(&a->peer,ok,now);
     if(a->test_channels) channel_test_session(&a->test,ok && a->peer.phase==HS_ESTABLISHED,
                                              a->peer.traffic.id,a->peer.traffic.max_payload,now);
@@ -38,7 +45,7 @@ static void net_send(void *arg,const uint8_t *b,size_t n) {
     struct app *a=arg;
     /* The core gates state; this final gate also covers a removal event that
      * happened during encryption. Never call into the core from this callback. */
-    if(!hsm_healthy(&a->hsm,monotonic_ms())) { a->send_drops++; return; }
+    if(!supervisor_healthy(&a->supervisor,monotonic_ms()) || !hsm_healthy(&a->hsm,monotonic_ms())) { a->send_drops++; return; }
     if(send(a->tunnel,b,n,MSG_DONTWAIT)!=(ssize_t)n) {
         a->send_drops++; if(errno==EMSGSIZE) a->mtu_drops++;
     }
@@ -48,7 +55,7 @@ static bool sign_request(void *arg,uint64_t generation,const uint8_t digest[32])
 }
 static void local_deliver(void *arg,unsigned ch,const uint8_t *b,size_t n) {
     struct app *a=arg;
-    if(!hsm_healthy(&a->hsm,monotonic_ms()) ||
+    if(!supervisor_healthy(&a->supervisor,monotonic_ms()) || !hsm_healthy(&a->hsm,monotonic_ms()) ||
        sendto(a->local[ch],b,n,MSG_DONTWAIT,(struct sockaddr *)&a->config.delivery[ch],
               sizeof(a->config.delivery[ch]))!=(ssize_t)n) a->local_drops++;
 }
@@ -80,7 +87,23 @@ static void read_datagrams(struct app *a,unsigned which) {
         OPENSSL_cleanse(b,sizeof(b));
     }
 }
-static bool read_pin(int supplied,uint8_t pin[128],size_t *length) {
+static bool pin_ready(enum hsm_discovery state) {
+    return state==HSM_READY || state==HSM_PIN_LOW || state==HSM_PIN_FINAL;
+}
+static enum ui_reason discovery_reason(enum hsm_discovery state) {
+    switch(state) {
+    case HSM_READY: return UI_OK;
+    case HSM_NO_CARD: return UI_NO_CARD;
+    case HSM_UNAVAILABLE: return UI_CARD_SERVICE;
+    case HSM_PIN_LOCKED: return UI_PIN_BLOCKED;
+    case HSM_PIN_INCORRECT: return UI_BAD_PIN;
+    case HSM_LOGIN_ERROR: return UI_LOGIN_FAILED;
+    case HSM_PIN_LOW: return UI_PIN_LOW;
+    case HSM_PIN_FINAL: return UI_PIN_FINAL;
+    default: return UI_BAD_IDENTITY;
+    }
+}
+static bool read_pin(int supplied,uint8_t pin[128],size_t *length,struct app *a) {
     int fd=supplied; bool terminal=false; struct termios old;
     if(fd<0) { fd=open("/dev/tty",O_RDWR|O_CLOEXEC); if(fd<0) return false; }
     if(isatty(fd)) {
@@ -90,7 +113,18 @@ static bool read_pin(int supplied,uint8_t pin[128],size_t *length) {
         terminal=true; (void)write(fd,"SmartCard-HSM PIN: ",18);
     }
     size_t n=0; bool ok=false;
+    uint64_t probe_at=0; enum hsm_discovery discovery=HSM_NO_CARD;
     while(n<127) {
+        uint64_t now=monotonic_ms();
+        if(!supervisor_poll(&a->supervisor,now)) break;
+        if(a->supervisor.fd>=0) {
+            if(now>=probe_at) {
+                discovery=hsm_probe(&a->config); probe_at=monotonic_ms()+1000;
+            }
+            supervisor_status(&a->supervisor,&a->config,&a->peer,
+                pin_ready(discovery)?UI_PIN_REQUIRED:UI_WAIT_CARD,
+                discovery_reason(discovery),monotonic_ms(),false,0);
+        }
         sigset_t pending;
         if(sigpending(&pending) || sigismember(&pending,SIGINT) || sigismember(&pending,SIGTERM)) break;
         struct pollfd input={.fd=fd,.events=POLLIN};
@@ -102,17 +136,18 @@ static bool read_pin(int supplied,uint8_t pin[128],size_t *length) {
         if(got<0) { if(errno==EINTR) continue; break; }
         if(!got || c=='\n') { ok=n>0; break; }
         if(c==0 || c=='\r') break;
+        if(a->supervisor.fd>=0 && !pin_ready(discovery)) break;
         pin[n++]=c;
     }
     if(terminal) { (void)tcsetattr(fd,TCSAFLUSH,&old); (void)write(fd,"\n",1); }
-    if(supplied<0) close(fd);
+    if(supplied<0 || a->supervisor.fd>=0) close(fd);
     *length=n; return ok;
 bad:
     if(supplied<0) close(fd);
     return false;
 }
 static void usage(void) {
-    puts("Usage: hsmproxy --config FILE [--pin-fd FD] [--test-channels]\n"
+    puts("Usage: hsmproxy --config FILE [--pin-fd FD] [--test-channels] [--supervise-fd FD]\n"
          "       hsmproxy --check-config FILE\n"
          "       hsmproxy --fingerprint PUBLIC_KEY_OR_CERTIFICATE\n"
          "--test-channels: replace gtk-pipe with local UDP probes on all three channels.\n"
@@ -130,7 +165,7 @@ static void stats(const struct app *a) {
         (unsigned long long)a->source_drops,(unsigned long long)a->mtu_drops);
 }
 int main(int argc,char **argv) {
-    const char *path=NULL,*fingerprint=NULL; int pin_fd=-1; bool check=false,test_channels=false;
+    const char *path=NULL,*fingerprint=NULL; int pin_fd=-1,supervise_fd=-1; bool check=false,test_channels=false;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--help")) { usage(); return 0; }
         if(!strcmp(argv[i],"--config") && i+1<argc && !path) path=argv[++i];
@@ -140,8 +175,13 @@ int main(int argc,char **argv) {
         else if(!strcmp(argv[i],"--pin-fd") && i+1<argc && pin_fd<0) {
             char *end; errno=0; long n=strtol(argv[++i],&end,10);
             if(errno || !*argv[i] || *end || n<0 || n>1048576) { usage(); return 2; } pin_fd=(int)n;
+        } else if(!strcmp(argv[i],"--supervise-fd") && i+1<argc && supervise_fd<0) {
+            char *end; errno=0; long n=strtol(argv[++i],&end,10);
+            if(errno || !*argv[i] || *end || n<3 || n>1048576) { usage(); return 2; }
+            supervise_fd=(int)n;
         } else { usage(); return 2; }
     }
+    if(supervise_fd>=0 && (pin_fd<0 || pin_fd==supervise_fd || check || fingerprint || test_channels)) { usage(); return 2; }
     if(fingerprint && !path && pin_fd<0 && !test_channels) {
         EVP_PKEY *key=load_public(fingerprint); uint8_t pin[32];
         bool ok=key && public_pin(key,pin); EVP_PKEY_free(key);
@@ -151,31 +191,40 @@ int main(int argc,char **argv) {
     }
     if(!path || fingerprint || (check && (pin_fd>=0 || test_channels))) { usage(); return 2; }
     struct app a={.tunnel=-1,.local={-1,-1,-1},.test_channels=test_channels,.test={.fd={-1,-1,-1}}}; char error[512];
-    if(!config_load(path,&a.config,error,sizeof(error))) { fprintf(stderr,"%s\n",error); return 2; }
+    if(!supervisor_init(&a.supervisor,supervise_fd,monotonic_ms())) { fputs("Invalid supervision socket\n",stderr); return 2; }
+    if(!config_load(path,&a.config,error,sizeof(error))) { fprintf(stderr,"%s\n",error); startup_error(&a); return 2; }
     EVP_PKEY *local=load_public(a.config.certificate), *remote=load_public(a.config.public_key);
     uint8_t expected[32],actual[32]; size_t len=32;
     if(!local || !remote || !parse_hex(a.config.pin_hex,expected,&len) || !public_pin(remote,actual) ||
        CRYPTO_memcmp(expected,actual,32)) {
         fputs("Invalid local/peer public key or peer SPKI pin mismatch\n",stderr);
-        EVP_PKEY_free(local); EVP_PKEY_free(remote); return 2;
+        startup_error(&a); EVP_PKEY_free(local); EVP_PKEY_free(remote); return 2;
     }
     struct peer_io io={net_send,sign_request,local_deliver,log_event,&a};
     if(!peer_init(&a.peer,!strcmp(a.config.role,"initiator"),a.config.max_payload,local,remote,io)) {
-        EVP_PKEY_free(local); EVP_PKEY_free(remote); return 2;
+        startup_error(&a); EVP_PKEY_free(local); EVP_PKEY_free(remote); return 2;
     }
     EVP_PKEY_free(remote);
     if(check) { puts("Configuration and public-key pins valid (hardware not checked)"); peer_destroy(&a.peer); EVP_PKEY_free(local); return 0; }
+    if(!supervisor_claim(&a.supervisor,&a.config)) {
+        supervisor_status(&a.supervisor,&a.config,&a.peer,UI_ERROR,UI_BUSY,monotonic_ms(),true,0);
+        fputs("Another managed hsmproxy uses these local ports\n",stderr);
+        peer_destroy(&a.peer); EVP_PKEY_free(local); return 1;
+    }
     struct rlimit no_core={0,0};
     if(setrlimit(RLIMIT_CORE,&no_core) || prctl(PR_SET_DUMPABLE,0)) { perror("disable core dumps"); peer_destroy(&a.peer); EVP_PKEY_free(local); return 1; }
     sigset_t mask; sigemptyset(&mask); sigaddset(&mask,SIGINT); sigaddset(&mask,SIGTERM); sigaddset(&mask,SIGUSR1);
     /* The PIN reader polls pending stop signals and restores terminal echo. */
     if(pthread_sigmask(SIG_BLOCK,&mask,NULL)) { peer_destroy(&a.peer); EVP_PKEY_free(local); return 1; }
     uint8_t pin[128]={0}; size_t pin_len=0;
-    bool got_pin=read_pin(pin_fd,pin,&pin_len);
+    bool got_pin=read_pin(pin_fd,pin,&pin_len,&a);
+    if(got_pin) supervisor_status(&a.supervisor,&a.config,&a.peer,UI_AUTHENTICATING,UI_OK,monotonic_ms(),true,0);
     bool opened=got_pin && hsm_open(&a.hsm,&a.config,local,pin,pin_len,error,sizeof(error));
     OPENSSL_cleanse(pin,sizeof(pin)); EVP_PKEY_free(local);
     if(!opened) {
         fprintf(stderr,"hsmproxy: %s\n",got_pin?error:"cannot read PIN; use a terminal or protected --pin-fd");
+        supervisor_status(&a.supervisor,&a.config,&a.peer,UI_ERROR,
+            got_pin?discovery_reason(a.hsm.open_error):UI_LOGIN_FAILED,monotonic_ms(),true,0);
         peer_destroy(&a.peer); return 1;
     }
     int ep=-1,timer=-1,signals=-1,result=1;
@@ -202,8 +251,13 @@ int main(int argc,char **argv) {
     while(running) {
         struct epoll_event events[10]; int n=epoll_wait(ep,events,10,100);
         if(n<0) { if(errno==EINTR) continue; perror("epoll_wait"); break; }
-        uint64_t now=monotonic_ms(); bool healthy=health(&a);
+        uint64_t now=monotonic_ms();
+        if(!supervisor_poll(&a.supervisor,now)) { (void)health(&a); result=0; break; }
+        if(a.supervisor.rekey) { a.supervisor.rekey=false; peer_rekey(&a.peer,now); }
+        bool healthy=health(&a);
         if(!healthy && (atomic_load(&a.hsm.failed) || now>=monitor_deadline)) {
+            a.end_reason=UI_CARD_LOST;
+            supervisor_status(&a.supervisor,&a.config,&a.peer,UI_ERROR,UI_CARD_LOST,now,true,a.mtu_drops);
             char detail[256]; hsm_failure_message(&a.hsm,detail,sizeof(detail),monotonic_ms());
             fprintf(stderr,"hsmproxy: HSM/PCSC HEALTH LOST: %s; restart with a fresh PIN after recovery\n",detail); break;
         }
@@ -234,6 +288,10 @@ int main(int argc,char **argv) {
             (void)health(&a);
             if(!channel_test_tick(&a.test,monotonic_ms())) { log_event(NULL,"CHANNEL TEST generation failed"); result=1; break; }
         }
+        healthy=health(&a);
+        enum ui_state state=a.peer.phase==HS_ESTABLISHED && healthy?UI_ESTABLISHED:
+                            a.peer.phase==HS_IDLE?UI_WAIT_PEER:UI_CONNECTING;
+        supervisor_status(&a.supervisor,&a.config,&a.peer,state,UI_OK,now,false,a.mtu_drops);
         if(now>=status_at) {
             stats(&a); if(a.test_channels) channel_test_report(&a.test); status_at=now+10000;
         }
@@ -243,14 +301,19 @@ int main(int argc,char **argv) {
         if(!a.test.completed || a.test.failed) result=1;
     }
     peer_close(&a.peer,monotonic_ms()); stats(&a);
-end:
+end:;
     /* Erase session state before waiting for potentially slow middleware. */
+    uint64_t generation=a.peer.generation;
     peer_destroy(&a.peer);
+    a.peer.generation=generation; /* terminal snapshot must not regress generation */
     if(a.test_channels) channel_test_close(&a.test);
     for(unsigned i=0;i<3;i++) if(a.local[i]>=0) close(a.local[i]);
     if(a.tunnel>=0) close(a.tunnel);
     if(ep>=0) close(ep);
     if(timer>=0) close(timer);
     if(signals>=0) close(signals);
+    supervisor_status(&a.supervisor,&a.config,&a.peer,result?UI_ERROR:UI_STOPPED,
+                      result?(a.end_reason?a.end_reason:UI_STARTUP_ERROR):UI_OK,monotonic_ms(),true,a.mtu_drops);
+    if(a.supervisor.fd>=0) close(a.supervisor.fd);
     hsm_close(&a.hsm); return result;
 }
