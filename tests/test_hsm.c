@@ -35,11 +35,19 @@ static void wait_health(struct hsm *h,bool expected) {
 }
 int main(void) {
     char path[512]; assert(realpath("tests/mock_pkcs11.so",path));
+    struct config c={0}; strcpy(c.module,path); strcpy(c.serial,"TEST123"); strcpy(c.reader,"Test Reader"); strcpy(c.key_id,"01");
+    /* Do not hold an extra dlopen reference here: it would hide the real
+     * discovery unload/reload bug. No PIN or identity operation is needed. */
+    assert(hsm_probe(&c)==HSM_READY);
+    assert(hsm_probe(&c)==HSM_READY);
     void *module=dlopen(path,RTLD_NOW|RTLD_LOCAL); assert(module);
+    void (*lifecycle)(unsigned[3])=NULL; void *counter_symbol=dlsym(module,"mock_lifecycle");
+    assert(counter_symbol); memcpy(&lifecycle,&counter_symbol,sizeof(lifecycle));
+    unsigned counts[3]; lifecycle(counts);
+    assert(counts[0]==2 && counts[1]==2 && counts[2]==0);
     void (*configure)(EVP_PKEY *,int)=NULL; void *symbol=dlsym(module,"mock_configure");
     assert(symbol); memcpy(&configure,&symbol,sizeof(configure));
     EVP_PKEY *key=EVP_PKEY_Q_keygen(NULL,NULL,"EC","prime256v1"); assert(key);
-    struct config c={0}; strcpy(c.module,path); strcpy(c.serial,"TEST123"); strcpy(c.reader,"Test Reader"); strcpy(c.key_id,"01");
     char error[256]; struct hsm h;
     configure(key,0);
     assert(hsm_probe(&c)==HSM_READY);

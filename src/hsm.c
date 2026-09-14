@@ -59,7 +59,12 @@ static bool prepare(struct hsm *h,const struct config *c,char *error,size_t cap)
     if(pthread_mutex_init(&h->mutex,NULL)) { snprintf(error,cap,"mutex initialization failed"); return false; }
     if(pthread_cond_init(&h->cond,NULL)) { pthread_mutex_destroy(&h->mutex); snprintf(error,cap,"condition initialization failed"); return false; }
     h->initialized=true; enum hsm_discovery code=HSM_UNAVAILABLE; const char *why="PKCS#11 module load failed";
-    h->module=dlopen(c->module,RTLD_NOW|RTLD_LOCAL); if(!h->module) goto bad;
+    /* Keep the module and its dependencies mapped until process exit. OpenSC's
+     * unload cleanup resets OpenPACE's OID-registration state, but OpenSSL 3
+     * retains those OIDs. Reloading on each discovery poll then registers them
+     * again (OBJ_create: oid exists). C_Finalize/session cleanup still run in
+     * hsm_close; this retains library state, not a login or any traffic keys. */
+    h->module=dlopen(c->module,RTLD_NOW|RTLD_LOCAL|RTLD_NODELETE); if(!h->module) goto bad;
     CK_C_GetFunctionList get=NULL; void *symbol=dlsym(h->module,"C_GetFunctionList");
     _Static_assert(sizeof(get)==sizeof(symbol),"function pointer representation");
     memcpy(&get,&symbol,sizeof(get));

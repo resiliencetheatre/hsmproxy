@@ -2,13 +2,30 @@
 #include <p11-kit/pkcs11.h>
 #include <openssl/evp.h>
 #include <openssl/ecdsa.h>
+#include <openssl/objects.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 static EVP_PKEY *key;
 static atomic_int mode;
+static bool objects_registered;
+static unsigned initializations, finalizations, logins;
+void mock_lifecycle(unsigned out[3]) {
+    out[0]=initializations; out[1]=finalizations; out[2]=logins;
+}
 void mock_configure(EVP_PKEY *k,int m) { key=k; atomic_store(&mode,m); }
-static CK_RV initialize(CK_VOID_PTR args) { (void)args; return CKR_OK; }
-static CK_RV finalize(CK_VOID_PTR args) { (void)args; return CKR_OK; }
+static CK_RV initialize(CK_VOID_PTR args) {
+    (void)args; initializations++;
+    /* Model OpenPACE: module-local registration state disappears on unload,
+     * but OpenSSL's process-wide OID table survives. Reload must not reset it. */
+    if(!objects_registered) {
+        if(OBJ_create("1.3.6.1.4.1.55555.9876.1","hsp-test-oid","hsmproxy test OID")==NID_undef)
+            return CKR_GENERAL_ERROR;
+        objects_registered=true;
+    }
+    return CKR_OK;
+}
+static CK_RV finalize(CK_VOID_PTR args) { (void)args; finalizations++; return CKR_OK; }
 static CK_RV slots(CK_BBOOL present,CK_SLOT_ID_PTR out,CK_ULONG_PTR n) {
     (void)present; if(atomic_load(&mode)==1) { *n=0; return CKR_OK; }
     if(*n<1) return CKR_BUFFER_TOO_SMALL;
@@ -41,6 +58,7 @@ static CK_RV session_info(CK_SESSION_HANDLE s,CK_SESSION_INFO_PTR info) {
     return CKR_OK;
 }
 static CK_RV login(CK_SESSION_HANDLE s,CK_USER_TYPE user,CK_UTF8CHAR_PTR pin,CK_ULONG n) {
+    logins++;
     (void)s; (void)user; return n==4 && !memcmp(pin,"1234",4)?CKR_OK:CKR_PIN_INCORRECT;
 }
 static CK_RV find_init(CK_SESSION_HANDLE s,CK_ATTRIBUTE_PTR attrs,CK_ULONG n) { (void)s; (void)attrs; (void)n; return CKR_OK; }

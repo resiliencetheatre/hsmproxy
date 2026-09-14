@@ -178,4 +178,26 @@ managed launch rejection, and supervised startup errors. GTK parser and headless
 controller tests cover PIN cancel/submit, buffer clearing, bad PIN, session
 refresh, disconnect/reconnect, stale/malformed status and dialog teardown.
 See [FRONTEND.md](FRONTEND.md) for commands and real-card acceptance requirements.
-No real-card two-host graphical test is claimed for this new frontend.
+No real-card two-host graphical test was claimed at initial implementation.
+
+### Operator follow-up and middleware reload regression (2026-09-14)
+
+The operator reports working smartcard authentication, tunnel establishment and
+video through the secure frontend, with repeated `OBJ_create: oid exists` and
+`objects.c:677: Error adding objects` messages. Detailed media measurements and
+fault-injection coverage remain as described above.
+
+Discovery loaded/unloaded OpenSC once per poll. OpenSC's module-unload cleanup
+resets OpenPACE's object-registration state while OpenSSL retains the registered
+OIDs; subsequent initialization attempts register the same objects again. This
+matches the [upstream OpenSC report](https://github.com/OpenSC/OpenSC/discussions/3563).
+The adapter now uses `RTLD_NODELETE` so the configured module and dependencies
+stay mapped until process exit. Session closure, logout, `C_Finalize`, and
+secret erasure still happen normally; no errors are filtered from the log.
+
+A mock provider regression registers a real test OID in OpenSSL and tracks
+initialization/finalization/login calls. Two discovery probes without another
+module reference failed before this change and pass afterward, with both probes
+finalized and no PIN login. Existing login/signing/card-removal tests continue
+to exercise the adapter afterward. Real-hardware confirmation that the reported
+messages have stopped is still pending.

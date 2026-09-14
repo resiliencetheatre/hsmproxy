@@ -183,7 +183,8 @@ standalone GTK Pipe launcher and keeps hsmproxy independent of GTK/GStreamer.
 ```sh
 make
 make -C gtk-pipe
-./gtk-pipe/gtk-pipe --secure-config /absolute/path/to/site-a.ini --hsmproxy "$PWD/hsmproxy"
+./gtk-pipe/gtk-pipe --secure --ini-file /absolute/path/to/site-a.ini \
+  --hsmproxy "$PWD/hsmproxy"
 ```
 
 Do not run a separate manual proxy for this connection. The secure frontend

@@ -1,9 +1,10 @@
 # GTK Pipe desktop integration
 
 Secure mode is optional. Plain `gtk-pipe` retains its standalone UDP behavior.
-`gtk-pipe --secure-config FILE` uses a separately installed hsmproxy process;
-`gtk-pipe --secure` opens a configuration chooser. No build-time source-tree
-dependency is introduced between the projects.
+`gtk-pipe --secure --ini-file FILE` uses a separately installed hsmproxy process
+without opening a chooser; `gtk-pipe --secure` opens a configuration chooser.
+The older `--secure-config FILE` spelling remains supported. No build-time
+source-tree dependency is introduced between the projects.
 
 ## Implementation plan and boundaries
 
@@ -44,7 +45,8 @@ make -C gtk-pipe
 From this workspace, run the combined interface without installing:
 
 ```sh
-./gtk-pipe/gtk-pipe --secure-config /absolute/path/to/site-a.ini --hsmproxy "$PWD/hsmproxy"
+./gtk-pipe/gtk-pipe --secure --ini-file /absolute/path/to/site-a.ini \
+  --hsmproxy "$PWD/hsmproxy"
 ```
 
 On the other host select its own site-b profile. Use existing provisioned INI
@@ -64,8 +66,9 @@ Ensure `~/.local/bin` is on the GNOME session's PATH. Alternatively configure
 `--hsmproxy /absolute/path/to/hsmproxy` in the secure desktop entry. GTK Pipe
 installation now supplies two launchers: **GTK Pipe** (original standalone
 mode) and **GTK Pipe Secure** (`--secure`, which opens a profile chooser).
-An administrator can set a fixed default by changing the secure launcher's
-Exec line to `gtk-pipe --secure-config /etc/hsmproxy/site-a.ini`.
+An administrator can set a fixed default and prevent the chooser by changing
+the secure launcher's Exec line to
+`gtk-pipe --secure --ini-file /etc/hsmproxy/site-a.ini`.
 
 The two source trees can be separated again. Neither Makefile refers to the
 other source tree, and neither project's installation copies test fixtures.
